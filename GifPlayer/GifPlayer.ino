@@ -249,6 +249,17 @@ void setup() {
   // CMD0. The delay also keeps the display's power-on current draw off the rail
   // while the card is still answering. The screen is only initialised early
   // enough to report a card failure, which is why that is reported after.
+#ifdef TFT_CS
+  // Park the display's chip select high before talking to the card. TFT_eSPI
+  // does not configure that pin until tft.init(), so it is still floating here,
+  // and a panel that reads its CS as low will drive MISO while the card is
+  // trying to answer CMD0.
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+#endif
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
   SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   bool sdOk = initSD();
   delay(100);
