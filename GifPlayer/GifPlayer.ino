@@ -7,11 +7,12 @@
 TFT_eSPI tft = TFT_eSPI();
 AnimatedGIF gif;
 
-// Set to 1 after moving the SD card's four signal wires onto their own pins
-// (see the wiring table in README.md). With a dedicated bus, chip select can be
-// held for a whole frame instead of per pixel run, which is what removes the
-// visible top-to-bottom "wipe" during playback.
-#define SD_DEDICATED_BUS 0
+// 1 = the card has its own SPI bus and pins (see README.md); 0 = the older
+// wiring where it shares the display's bus. A dedicated bus is what makes the
+// card initialise reliably, and it also lets chip select be held for a whole
+// frame instead of per pixel run, which removes the visible top-to-bottom
+// "wipe" during playback.
+#define SD_DEDICATED_BUS 1
 
 #define BTN_NEXT 32
 #define BTN_PREV 33

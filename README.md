@@ -5,48 +5,50 @@ push buttons to cycle through files.
 
 ## Hardware
 
-Default wiring — display and SD card on one shared SPI bus (`SD_DEDICATED_BUS 0`):
+The card gets its own SPI bus (`SD_DEDICATED_BUS 1`, the default): on ESP32 it
+runs on HSPI while TFT_eSPI keeps VSPI. Sharing one bus with the display did not
+work here — the card never got past CMD0.
 
 | Signal        | ESP32 pin |
 | ------------- | --------- |
-| SPI SCK       | 18        |
-| SPI MISO      | 19        |
-| SPI MOSI      | 23        |
-| SD chip select| 15        |
+| SD SCK        | 25        |
+| SD MISO       | 21        |
+| SD MOSI       | 26        |
+| SD chip select| 4         |
 | Next button   | 32 (to GND, internal pull-up) |
 | Prev button   | 33 (to GND, internal pull-up) |
 
-The TFT chip-select / DC / RST pins are configured in TFT_eSPI's
-`User_Setup.h`, not in the sketch. On the shared bus `SUPPORT_TRANSACTIONS` must
-be enabled in the TFT_eSPI setup (it is on by default for ESP32).
+The display's SCK/MOSI/CS/DC/RST pins are configured in TFT_eSPI's
+`User_Setup.h`, not in the sketch, and none of them are shared with the card.
+
+Setting `SD_DEDICATED_BUS` to `0` selects the old shared-bus wiring (SCK 18,
+MISO 19, MOSI 23, SD CS 15) for reference. That path needs
+`SUPPORT_TRANSACTIONS` in the TFT_eSPI setup, is slower, and puts the card's chip
+select on GPIO15, which is a boot strapping pin.
 
 ## Playback speed
 
 If frames visibly wipe down the screen, the display is spending its time on bus
-overhead rather than pixels. In order of effect:
+overhead rather than pixels.
 
-1. **Give the SD card its own bus.** Set `SD_DEDICATED_BUS` to `1` in the sketch
-   and move the card's four signal wires (VCC/GND stay put):
-
-   | SD signal | new ESP32 pin |
-   | --------- | ------------- |
-   | SCK       | 25 |
-   | MISO      | 21 |
-   | MOSI      | 26 |
-   | CS        | 4  |
-
-   The card then runs on HSPI while the display keeps VSPI, and the sketch can
-   claim the display's chip select once per frame instead of once per pixel run.
-   All four wires must move together. On the shared bus that per-frame claim is
-   *not* safe — `gif.playFrame()` reads the card between scanlines, so holding
-   the display selected across those reads drives two devices at once — which is
-   why the sketch keys this off the same flag as the pin choice.
+1. **Keep `SD_DEDICATED_BUS 1`.** It lets the sketch claim the display's chip
+   select once per frame instead of once per pixel run. On a shared bus that
+   per-frame claim is *not* safe — `gif.playFrame()` reads the card between
+   scanlines, so holding the display selected across those reads drives two
+   devices at once — which is why the sketch keys the locking off the same flag
+   as the pin choice.
 2. **Raise `SPI_FREQUENCY` in `User_Setup.h`.** ILI9488 panels usually run at
    40 MHz; the TFT_eSPI defaults are more conservative.
 3. **DMA (`pushPixelsDMA`).** Overlaps the transfer of one line with decoding of
    the next, but needs alternating line buffers to avoid overwriting a buffer
-   mid-transfer, and TFT_eSPI's DMA must not be used while sharing the bus with
-   the SD card. Not implemented here.
+   mid-transfer. Not implemented here.
+
+## Troubleshooting
+
+[`SdCardTest/SdCardTest.ino`](SdCardTest/SdCardTest.ino) is a standalone card
+check: no display, no GIF decoding. It reports the MISO idle level, bit-bangs
+CMD0 and prints the raw response (`01` = card alive in SPI mode, all `FF` =
+nothing driving MISO), then mounts the card and lists the root.
 
 ## Libraries
 

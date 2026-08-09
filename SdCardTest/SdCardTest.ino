@@ -9,11 +9,11 @@
 
 // Match GifPlayer.ino. If the card has its own bus, change these to 25/21/26/4
 // and set SD_DEDICATED_BUS to 1.
-#define SD_DEDICATED_BUS 0
-#define SD_SCK   18
-#define SD_MISO  19
-#define SD_MOSI  23
-#define SD_CS    15
+#define SD_DEDICATED_BUS 1
+#define SD_SCK   25
+#define SD_MISO  21
+#define SD_MOSI  26
+#define SD_CS     4
 
 // The display's chip select, from TFT_eSPI's User_Setup.h. Set to -1 if no
 // display is wired to this bus.
