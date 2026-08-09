@@ -46,6 +46,9 @@ static const unsigned long DEBOUNCE_MS = 40;
 // button polling.
 static const int MIN_FRAME_MS = 10;
 
+// 1 = log each frame's geometry, disposal method and timing over serial.
+#define DEBUG_FRAMES 0
+
 #define MAX_GIFS 32
 #define MAX_NAME_LEN 64
 
@@ -95,6 +98,13 @@ void GIFDraw(GIFDRAW *pDraw) {
   // SPI because begin() was called with BIG_ENDIAN_PIXELS.
   uint16_t *pPal = pDraw->pPalette;
   uint8_t *s = pDraw->pPixels;
+
+#if DEBUG_FRAMES
+  if (pDraw->y == 0)
+    Serial.printf("frame x=%d y=%d w=%d h=%d disposal=%u transparent=%u\n",
+                  pDraw->iX, pDraw->iY, pDraw->iWidth, pDraw->iHeight,
+                  pDraw->ucDisposalMethod, pDraw->ucHasTransparency);
+#endif
 
   if (pDraw->ucDisposalMethod == 2) {
     // "Restore to background": transparent pixels become the background colour
@@ -319,12 +329,19 @@ void loop() {
   // block inside the library and swallow button presses.
   if (gifIsOpen && (long)(millis() - nextFrameMs) >= 0) {
     int frameDelayMs = 0;
+#if DEBUG_FRAMES
+    unsigned long frameStartMs = millis();
+#endif
 #if SD_DEDICATED_BUS
     tft.startWrite();
 #endif
     int result = gif.playFrame(false, &frameDelayMs);
 #if SD_DEDICATED_BUS
     tft.endWrite();
+#endif
+#if DEBUG_FRAMES
+    Serial.printf("  decode+draw %lums, gif asks for %dms\n",
+                  millis() - frameStartMs, frameDelayMs);
 #endif
     if (frameDelayMs < MIN_FRAME_MS) frameDelayMs = MIN_FRAME_MS;
     nextFrameMs = millis() + frameDelayMs;
