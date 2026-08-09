@@ -7,13 +7,31 @@
 TFT_eSPI tft = TFT_eSPI();
 AnimatedGIF gif;
 
-#define SD_CS    15
+// 1 = the card has its own SPI bus and pins (see README.md); 0 = the older
+// wiring where it shares the display's bus. A dedicated bus is what makes the
+// card initialise reliably, and it also lets chip select be held for a whole
+// frame instead of per pixel run, which removes the visible top-to-bottom
+// "wipe" during playback.
+#define SD_DEDICATED_BUS 1
+
 #define BTN_NEXT 32
 #define BTN_PREV 33
 
-#define SPI_SCK  18
-#define SPI_MISO 19
-#define SPI_MOSI 23
+#if SD_DEDICATED_BUS
+  #define SD_SCK   25
+  #define SD_MISO  21
+  #define SD_MOSI  26
+  #define SD_CS     4
+  SPIClass sdSPI(HSPI);
+  #define SD_SPI sdSPI
+#else
+  // Shared with the display: TFT_eSPI drives these same pins from User_Setup.h.
+  #define SD_SCK   18
+  #define SD_MISO  19
+  #define SD_MOSI  23
+  #define SD_CS    15
+  #define SD_SPI SPI
+#endif
 
 // Widest line the display can ask us to push, in pixels.
 #define MAX_LINE_PIXELS 480
@@ -24,67 +42,174 @@ static const uint32_t SD_CLOCKS[] = {16000000, 8000000, 4000000, 1000000};
 
 static const unsigned long DEBOUNCE_MS = 40;
 
+// Slowest frame rate we will honour, so a GIF with a 0 ms delay cannot starve
+// button polling.
+static const int MIN_FRAME_MS = 10;
+
+// 1 = log each frame's geometry, disposal method and timing over serial.
+#define DEBUG_FRAMES 0
+
+// Consecutive frame failures tolerated on one file before skipping it.
+static const int MAX_FRAME_ERRORS = 3;
+
+// 1 = let AnimatedGIF compose whole lines in a canvas-sized buffer ("cooked"
+// pixels) instead of handing us palettised lines to stitch together. Each line
+// then becomes one contiguous push under a single address window per frame,
+// instead of one address window per opaque run.
+//
+// Needs canvas width * (canvas height + 2) bytes of heap; the sketch falls back
+// to composing the lines itself if that allocation fails.
+#define COOKED_PIXELS 1
+
+// 1 = push each cooked line by DMA, so one line transfers while the next is
+// decoded. TFT_eSPI only offers DMA when the panel is not in 18-bit mode, so this
+// is live on an ST7735 and silently unavailable on an ILI9488: ESP32_DMA is what
+// the library defines in that case, and without it initDMA() does not even link.
+#define USE_DMA 1
+
+#if USE_DMA && defined(ESP32_DMA)
+  #define DMA_AVAILABLE 1
+#else
+  #define DMA_AVAILABLE 0
+#endif
+
+#define MAX_GIFS 32
+#define MAX_NAME_LEN 64
+
 File gifFile;
-const int TOTAL_GIFS = 3;
-int currentGifIdx = 1;
+char gifNames[MAX_GIFS][MAX_NAME_LEN];
+int gifCount = 0;
+int currentGifIdx = 0;
 bool changeGifSignal = false;
 bool gifIsOpen = false;
+unsigned long nextFrameMs = 0;
+int frameErrors = 0;
+uint8_t *frameBuf = NULL;
+bool cooked = false;             // library is composing whole lines for us
+bool cookedWindowSet = false;    // address window already set for this frame
 
-uint16_t globalPalette[256];
-char filenameBuffer[64];
+// Centring offsets for the file currently open, recomputed once per file.
+int xOffset = 0;
+int yOffset = 0;
+
+static uint16_t lineBuffer[MAX_LINE_PIXELS];
+
+#if DMA_AVAILABLE
+// Two buffers, used alternately: a DMA transfer reads from memory after the call
+// returns, so the next line has to be assembled somewhere else. pushPixelsDMA()
+// waits for the outstanding transfer before starting a new one, which is what
+// makes two enough.
+static uint16_t dmaBuffer[2][MAX_LINE_PIXELS];
+static uint8_t dmaSlot = 0;
+
+static void pushRunDMA(int len, uint16_t *pixels) {
+  uint16_t *dst = dmaBuffer[dmaSlot];
+  dmaSlot ^= 1;
+  memcpy(dst, pixels, len * sizeof(uint16_t));
+  tft.pushPixelsDMA(dst, len);
+}
+#endif
+
+// Pushes one horizontal run of pixels.
+//
+// On a dedicated SD bus the caller claims the display for the whole frame, so
+// this is just an address window plus the data. On a shared bus it has to be its
+// own short transaction: gif.playFrame() reads the SD card between scanlines,
+// and holding the display's chip select across those reads would put two devices
+// on the bus at once.
+static void pushRun(int x, int y, int len, uint16_t *pixels) {
+#if !SD_DEDICATED_BUS
+  tft.startWrite();
+#endif
+  tft.setAddrWindow(x, y, len, 1);
+  tft.pushPixels(pixels, len);
+#if !SD_DEDICATED_BUS
+  tft.endWrite();
+#endif
+}
 
 void GIFDraw(GIFDRAW *pDraw) {
-  static uint16_t lineBuffer[MAX_LINE_PIXELS];
-
-  // Centre the canvas, but never start off-screen when it is larger than the
-  // display: a negative offset would make setAddrWindow() wrap the write.
-  int x_offset = (tft.width() - gif.getCanvasWidth()) / 2;
-  int y_offset = (tft.height() - gif.getCanvasHeight()) / 2;
-  if (x_offset < 0) x_offset = 0;
-  if (y_offset < 0) y_offset = 0;
-
-  int drawX = pDraw->iX + x_offset;
-  int drawY = pDraw->y + pDraw->iY + y_offset;
-  if (drawX >= tft.width() || drawY >= tft.height() || drawY < 0) return;
+  int drawX = pDraw->iX + xOffset;
+  int drawY = pDraw->iY + pDraw->y + yOffset;
+  if (drawX >= tft.width() || drawY >= tft.height() || drawX < 0 || drawY < 0) return;
 
   int iWidth = pDraw->iWidth;
   if (drawX + iWidth > tft.width()) iWidth = tft.width() - drawX;
   if (iWidth > MAX_LINE_PIXELS) iWidth = MAX_LINE_PIXELS;
   if (iWidth < 1) return;
 
-  uint16_t *pPal = globalPalette;
+#if DEBUG_FRAMES
+  if (pDraw->y == 0)
+    Serial.printf("frame x=%d y=%d w=%d h=%d disposal=%u transparent=%u\n",
+                  pDraw->iX, pDraw->iY, pDraw->iWidth, pDraw->iHeight,
+                  pDraw->ucDisposalMethod, pDraw->ucHasTransparency);
+#endif
 
-  if (pDraw->pPalette == NULL) {
-    // pPalette24 is raw RGB byte triplets: R,G,B,R,G,B,...
-    for (int x = 0; x < 256; x++) {
-      uint8_t r = pDraw->pPalette24[x * 3 + 0];
-      uint8_t g = pDraw->pPalette24[x * 3 + 1];
-      uint8_t b = pDraw->pPalette24[x * 3 + 2];
-      pPal[x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+#if COOKED_PIXELS
+  if (cooked) {
+    // pPixels is a finished RGB565 line: the library has already applied the
+    // palette, transparency and disposal against its canvas buffer, so the whole
+    // line goes out in one push. On a dedicated bus the address window can also
+    // stay open for the rest of the frame, which removes one command/data switch
+    // per line - the expensive part on an SPI panel.
+    uint16_t *src = (uint16_t *)pDraw->pPixels;
+    int w = pDraw->iWidth;
+    if (drawX + w > tft.width()) w = tft.width() - drawX;
+    if (w < 1) return;
+#if SD_DEDICATED_BUS
+    if (w == pDraw->iWidth &&
+        pDraw->iY + yOffset + pDraw->iHeight <= tft.height()) {
+      if (!cookedWindowSet) {
+        tft.setAddrWindow(drawX, pDraw->iY + yOffset, w, pDraw->iHeight);
+        cookedWindowSet = true;
+      }
+#if DMA_AVAILABLE
+      pushRunDMA(w, src);
+#else
+      tft.pushPixels(src, w);
+#endif
+      return;
     }
-  } else {
-    // Already RGB565, already byte-swapped by BIG_ENDIAN_PIXELS — use directly
-    for (int x = 0; x < 256; x++) pPal[x] = pDraw->pPalette[x];
+#endif
+    pushRun(drawX, drawY, w, src);
+    return;
   }
+#endif
 
+  // pPalette is always populated by the library and is already byte-swapped for
+  // SPI because begin() was called with BIG_ENDIAN_PIXELS.
+  uint16_t *pPal = pDraw->pPalette;
   uint8_t *s = pDraw->pPixels;
 
-  if (pDraw->ucHasTransparency) {
-    uint8_t ucTransparent = pDraw->ucTransparent;
+  if (pDraw->ucDisposalMethod == 2) {
+    // "Restore to background": transparent pixels become the background colour
+    // instead of leaving the previous frame visible.
     for (int x = 0; x < iWidth; x++)
-      lineBuffer[x] = (s[x] == ucTransparent) ? TFT_BLACK : pPal[s[x]];
-  } else {
-    for (int x = 0; x < iWidth; x++)
-      lineBuffer[x] = pPal[s[x]];
+      if (s[x] == pDraw->ucTransparent) s[x] = pDraw->ucBackground;
+    pDraw->ucHasTransparency = 0;
   }
 
-  tft.startWrite();
-  tft.setAddrWindow(drawX, drawY, iWidth, 1);
-  tft.pushPixels(lineBuffer, iWidth);
-  tft.endWrite();
+  if (!pDraw->ucHasTransparency) {
+    for (int x = 0; x < iWidth; x++) lineBuffer[x] = pPal[s[x]];
+    pushRun(drawX, drawY, iWidth, lineBuffer);
+    return;
+  }
+
+  // Transparent pixels must be left untouched so the previous frame shows
+  // through: draw the opaque runs only, skipping over the transparent ones.
+  uint8_t ucTransparent = pDraw->ucTransparent;
+  int x = 0;
+  while (x < iWidth) {
+    while (x < iWidth && s[x] == ucTransparent) x++;
+    int runStart = x;
+    int len = 0;
+    while (x < iWidth && s[x] != ucTransparent) lineBuffer[len++] = pPal[s[x++]];
+    if (len) pushRun(drawX + runStart, drawY, len, lineBuffer);
+  }
 }
 
 void * GIFOpenFile(const char *fname, int32_t *pSize) {
+  if (gifFile) gifFile.close();
   gifFile = SD.open(fname);
   if (!gifFile) return NULL;
   *pSize = gifFile.size();
@@ -99,6 +224,12 @@ void GIFCloseFile(void *pHandle) {
 int32_t GIFReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
   File *f = (File *)pFile->fHandle;
   if (!f) return 0;
+
+  // Never consume the final byte: on the Arduino SD library, seeking after
+  // reaching end-of-file stops working, and playFrame() seeks back to 0 to loop.
+  if (pFile->iSize - pFile->iPos < iLen) iLen = pFile->iSize - pFile->iPos - 1;
+  if (iLen <= 0) return 0;
+
   int32_t bytesRead = f->read(pBuf, iLen);
   if (bytesRead < 0) bytesRead = 0;
   pFile->iPos = f->position();   // keep the library's internal position in sync
@@ -118,27 +249,86 @@ void showFatalError(const char *msg) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_RED, TFT_BLACK);
   tft.setTextSize(2);
+  tft.setTextWrap(true);
   tft.setCursor(10, 10);
   tft.print(msg);
+}
+
+static bool hasGifExtension(const char *name) {
+  const char *dot = strrchr(name, '.');
+  return dot && strcasecmp(dot, ".gif") == 0;
+}
+
+// Indexes the GIFs in the card root, so the playlist matches what is actually
+// on the card instead of a hard-coded count and naming scheme.
+void scanGifs() {
+  gifCount = 0;
+  File root = SD.open("/");
+  if (!root) return;
+
+  for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
+    if (!entry.isDirectory() && hasGifExtension(entry.name())) {
+      // entry.name() is bare on some core versions and absolute on others.
+      const char *name = entry.name();
+      if (name[0] == '/') snprintf(gifNames[gifCount], MAX_NAME_LEN, "%s", name);
+      else snprintf(gifNames[gifCount], MAX_NAME_LEN, "/%s", name);
+      Serial.printf("Found: %s\n", gifNames[gifCount]);
+      if (++gifCount >= MAX_GIFS) { entry.close(); break; }
+    }
+    entry.close();
+  }
+  root.close();
+  Serial.printf("%d GIF(s) on card\n", gifCount);
+}
+
+// Gives the library a canvas-sized buffer so it can hand back finished pixels.
+// Sized per file, since the canvas differs between files. Falls back to the
+// palettised path when there is not enough heap, which is why the sketch still
+// carries its own transparency and disposal handling.
+void setupFrameBuf() {
+  cooked = false;
+#if COOKED_PIXELS
+  if (frameBuf) { free(frameBuf); frameBuf = NULL; }
+
+  int w = gif.getCanvasWidth();
+  int h = gif.getCanvasHeight();
+  // Canvas as 8-bit pixels, plus two lines of room for the composed output.
+  size_t need = (size_t)w * (h + 2);
+  frameBuf = (uint8_t *)malloc(need);
+  if (!frameBuf) {
+    Serial.printf("cooked mode off: %u bytes unavailable (%u free)\n",
+                  (unsigned)need, (unsigned)ESP.getFreeHeap());
+    gif.setDrawType(GIF_DRAW_RAW);
+    return;
+  }
+  gif.setFrameBuf(frameBuf);
+  cooked = (gif.setDrawType(GIF_DRAW_COOKED) == GIF_SUCCESS);
+  Serial.printf("cooked mode %s (%u byte canvas buffer)\n",
+                cooked ? "on" : "off", (unsigned)need);
+#endif
 }
 
 void startNewGif(int index) {
   if (gifIsOpen) gif.close();
   gifIsOpen = false;
-  changeGifSignal = false;   // cleared unconditionally: a missing file must not
+  changeGifSignal = false;   // cleared unconditionally: a failed open must not
                              // make loop() retry on every iteration
   tft.fillScreen(TFT_BLACK);
-  snprintf(filenameBuffer, sizeof(filenameBuffer), "/%d.gif", index);
-  Serial.print("Playing: "); Serial.println(filenameBuffer);
+  if (gifCount == 0) return;
 
-  if (!SD.exists(filenameBuffer)) {
-    Serial.print("ERROR: file not found: "); Serial.println(filenameBuffer);
-    return;
-  }
+  Serial.print("Playing: "); Serial.println(gifNames[index]);
 
-  if (gif.open(filenameBuffer, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw)) {
+  if (gif.open(gifNames[index], GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw)) {
+    // Computed once per file: the canvas size cannot change mid-file, and a
+    // negative offset would make setAddrWindow() wrap the write.
+    xOffset = (tft.width() - gif.getCanvasWidth()) / 2;
+    yOffset = (tft.height() - gif.getCanvasHeight()) / 2;
+    if (xOffset < 0) xOffset = 0;
+    if (yOffset < 0) yOffset = 0;
     Serial.printf("GIF opened OK: %d x %d\n", gif.getCanvasWidth(), gif.getCanvasHeight());
+    setupFrameBuf();
     gifIsOpen = true;
+    nextFrameMs = millis();
   } else {
     Serial.print("ERROR: gif.open() failed, code: ");
     Serial.println(gif.getLastError());
@@ -148,7 +338,7 @@ void startNewGif(int index) {
 bool initSD() {
   for (unsigned i = 0; i < sizeof(SD_CLOCKS) / sizeof(SD_CLOCKS[0]); i++) {
     Serial.printf("Initializing SD card at %lu Hz... ", (unsigned long)SD_CLOCKS[i]);
-    if (SD.begin(SD_CS, SPI, SD_CLOCKS[i])) {
+    if (SD.begin(SD_CS, SD_SPI, SD_CLOCKS[i])) {
       Serial.println("OK");
       return true;
     }
@@ -167,16 +357,44 @@ void setup() {
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
 
-  // Bring the display up first so SD failures can be reported on screen.
+  // Order is load-bearing: the card must be brought up before tft.init().
+  // Calling SPI.begin() afterwards tears down the bus TFT_eSPI just claimed
+  // ("spiDetachBus(): Stopping SPI bus"), and the card then answers nothing at
+  // CMD0. The delay also keeps the display's power-on current draw off the rail
+  // while the card is still answering. The screen is only initialised early
+  // enough to report a card failure, which is why that is reported after.
+#ifdef TFT_CS
+  // Park the display's chip select high before talking to the card. TFT_eSPI
+  // does not configure that pin until tft.init(), so it is still floating here,
+  // and a panel that reads its CS as low will drive MISO while the card is
+  // trying to answer CMD0.
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+#endif
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  bool sdOk = initSD();
+  delay(100);
+
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  Serial.println("OK: tft.init() complete");
+#if DMA_AVAILABLE
+  tft.initDMA();
+#endif
+  Serial.printf("OK: tft.init() complete, %dx%d, DMA %s\n",
+                tft.width(), tft.height(), DMA_AVAILABLE ? "on" : "off");
 
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
-
-  if (!initSD()) {
+  if (!sdOk) {
     showFatalError("SD card init failed");
+    while (1) delay(1000);
+  }
+
+  scanGifs();
+  if (gifCount == 0) {
+    showFatalError("No .gif files found on SD card");
     while (1) delay(1000);
   }
 
@@ -204,26 +422,55 @@ void loop() {
   static unsigned long nextChangeMs = 0, prevChangeMs = 0;
 
   if (buttonPressed(BTN_NEXT, nextState, nextChangeMs)) {
-    currentGifIdx++;
-    if (currentGifIdx > TOTAL_GIFS) currentGifIdx = 1;
+    currentGifIdx = (currentGifIdx + 1) % gifCount;
     changeGifSignal = true;
-  } else if (buttonPressed(BTN_PREV, prevState, prevChangeMs)) {
-    currentGifIdx--;
-    if (currentGifIdx < 1) currentGifIdx = TOTAL_GIFS;
+  }
+  if (buttonPressed(BTN_PREV, prevState, prevChangeMs)) {
+    currentGifIdx = (currentGifIdx + gifCount - 1) % gifCount;
     changeGifSignal = true;
   }
 
   if (changeGifSignal) startNewGif(currentGifIdx);
 
-  if (gifIsOpen) {
-    int result = gif.playFrame(true, NULL);
+  // Frame pacing is done here rather than by playFrame(true, ...), which would
+  // block inside the library and swallow button presses.
+  if (gifIsOpen && (long)(millis() - nextFrameMs) >= 0) {
+    int frameDelayMs = 0;
+#if DEBUG_FRAMES
+    unsigned long frameStartMs = millis();
+#endif
+    cookedWindowSet = false;   // each frame opens its own address window
+#if SD_DEDICATED_BUS
+    tft.startWrite();
+#endif
+    int result = gif.playFrame(false, &frameDelayMs);
+#if SD_DEDICATED_BUS
+    tft.endWrite();
+#endif
+#if DEBUG_FRAMES
+    Serial.printf("  decode+draw %lums, gif asks for %dms\n",
+                  millis() - frameStartMs, frameDelayMs);
+#endif
+    if (frameDelayMs < MIN_FRAME_MS) frameDelayMs = MIN_FRAME_MS;
+    nextFrameMs = millis() + frameDelayMs;
+
     if (result == 0) {
       gif.reset();            // last frame decoded: start the animation over
+      frameErrors = 0;
     } else if (result < 0) {
-      Serial.print("ERROR: playFrame() failed, getLastError(): ");
-      Serial.println(gif.getLastError());
-      gif.close();
-      gifIsOpen = false;
+      // A short read from the card surfaces here as GIF_EARLY_EOF (6). Reopening
+      // the file recovers from a transient one instead of freezing on the last
+      // frame drawn; a file that keeps failing is skipped.
+      Serial.printf("ERROR: playFrame() failed, getLastError(): %d\n",
+                    gif.getLastError());
+      if (++frameErrors >= MAX_FRAME_ERRORS) {
+        Serial.println("giving up on this file, moving to the next one");
+        frameErrors = 0;
+        currentGifIdx = (currentGifIdx + 1) % gifCount;
+      }
+      startNewGif(currentGifIdx);
+    } else {
+      frameErrors = 0;
     }
   }
 }
