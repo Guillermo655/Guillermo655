@@ -14,6 +14,11 @@ static uint16_t lineBuffer[MAX_LINE_PIXELS];
 
 static const unsigned long HOLD_MS = 3000;
 
+// Raw RGB565 constants are pushed here, so the byte order has to be corrected
+// for the panel. On ILI9488 (SPI_18BIT_DRIVER) TFT_eSPI inverts the sense of
+// this flag: setSwapBytes(true) is what sends TFT_BLUE as blue. The GIF player
+// leaves it alone because AnimatedGIF is told BIG_ENDIAN_PIXELS and hands over
+// palette entries that are already swapped.
 static void pushRun(int x, int y, int len, uint16_t *pixels) {
   tft.setAddrWindow(x, y, len, 1);
   tft.pushPixels(pixels, len);
@@ -85,6 +90,7 @@ void setup() {
 
   tft.init();
   tft.setRotation(1);
+  tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
   Serial.printf("panel: %d x %d\n", tft.width(), tft.height());
 #ifdef SPI_FREQUENCY
@@ -116,4 +122,11 @@ void loop() {
   patternOddRuns(30, 2, 420, 315);
   hold("4: ragged vertical white stripes, straight and inside the box. Sheared "
        "or leaning stripes = short runs are misaligning.");
+
+  // Whether fillScreen() actually clears matters on its own: the player relies
+  // on it between files, and leftovers would look like stray bands behind a GIF.
+  tft.fillScreen(TFT_BLACK);
+  patternSolidRect(200, 130, 80, 60, TFT_WHITE);
+  hold("5: one small white box in the middle of an otherwise black screen. "
+       "Anything left over from pattern 4 means fillScreen() is not clearing.");
 }
