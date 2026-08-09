@@ -49,6 +49,9 @@ static const int MIN_FRAME_MS = 10;
 // 1 = log each frame's geometry, disposal method and timing over serial.
 #define DEBUG_FRAMES 0
 
+// Consecutive frame failures tolerated on one file before skipping it.
+static const int MAX_FRAME_ERRORS = 3;
+
 #define MAX_GIFS 32
 #define MAX_NAME_LEN 64
 
@@ -59,6 +62,7 @@ int currentGifIdx = 0;
 bool changeGifSignal = false;
 bool gifIsOpen = false;
 unsigned long nextFrameMs = 0;
+int frameErrors = 0;
 
 // Centring offsets for the file currently open, recomputed once per file.
 int xOffset = 0;
@@ -348,11 +352,21 @@ void loop() {
 
     if (result == 0) {
       gif.reset();            // last frame decoded: start the animation over
+      frameErrors = 0;
     } else if (result < 0) {
-      Serial.print("ERROR: playFrame() failed, getLastError(): ");
-      Serial.println(gif.getLastError());
-      gif.close();
-      gifIsOpen = false;
+      // A short read from the card surfaces here as GIF_EARLY_EOF (6). Reopening
+      // the file recovers from a transient one instead of freezing on the last
+      // frame drawn; a file that keeps failing is skipped.
+      Serial.printf("ERROR: playFrame() failed, getLastError(): %d\n",
+                    gif.getLastError());
+      if (++frameErrors >= MAX_FRAME_ERRORS) {
+        Serial.println("giving up on this file, moving to the next one");
+        frameErrors = 0;
+        currentGifIdx = (currentGifIdx + 1) % gifCount;
+      }
+      startNewGif(currentGifIdx);
+    } else {
+      frameErrors = 0;
     }
   }
 }
