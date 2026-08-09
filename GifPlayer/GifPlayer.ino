@@ -7,13 +7,30 @@
 TFT_eSPI tft = TFT_eSPI();
 AnimatedGIF gif;
 
-#define SD_CS    15
+// Set to 1 after moving the SD card's four signal wires onto their own pins
+// (see the wiring table in README.md). With a dedicated bus, chip select can be
+// held for a whole frame instead of per pixel run, which is what removes the
+// visible top-to-bottom "wipe" during playback.
+#define SD_DEDICATED_BUS 0
+
 #define BTN_NEXT 32
 #define BTN_PREV 33
 
-#define SPI_SCK  18
-#define SPI_MISO 19
-#define SPI_MOSI 23
+#if SD_DEDICATED_BUS
+  #define SD_SCK   25
+  #define SD_MISO  21
+  #define SD_MOSI  26
+  #define SD_CS     4
+  SPIClass sdSPI(HSPI);
+  #define SD_SPI sdSPI
+#else
+  // Shared with the display: TFT_eSPI drives these same pins from User_Setup.h.
+  #define SD_SCK   18
+  #define SD_MISO  19
+  #define SD_MOSI  23
+  #define SD_CS    15
+  #define SD_SPI SPI
+#endif
 
 // Widest line the display can ask us to push, in pixels.
 #define MAX_LINE_PIXELS 480
@@ -45,14 +62,22 @@ int yOffset = 0;
 
 static uint16_t lineBuffer[MAX_LINE_PIXELS];
 
-// Pushes one horizontal run of pixels. Kept as a short transaction rather than
-// holding chip select across the whole frame, because the SD card shares this
-// SPI bus and is read from inside gif.playFrame().
+// Pushes one horizontal run of pixels.
+//
+// On a dedicated SD bus the caller claims the display for the whole frame, so
+// this is just an address window plus the data. On a shared bus it has to be its
+// own short transaction: gif.playFrame() reads the SD card between scanlines,
+// and holding the display's chip select across those reads would put two devices
+// on the bus at once.
 static void pushRun(int x, int y, int len, uint16_t *pixels) {
+#if !SD_DEDICATED_BUS
   tft.startWrite();
+#endif
   tft.setAddrWindow(x, y, len, 1);
   tft.pushPixels(pixels, len);
+#if !SD_DEDICATED_BUS
   tft.endWrite();
+#endif
 }
 
 void GIFDraw(GIFDRAW *pDraw) {
@@ -199,7 +224,7 @@ void startNewGif(int index) {
 bool initSD() {
   for (unsigned i = 0; i < sizeof(SD_CLOCKS) / sizeof(SD_CLOCKS[0]); i++) {
     Serial.printf("Initializing SD card at %lu Hz... ", (unsigned long)SD_CLOCKS[i]);
-    if (SD.begin(SD_CS, SPI, SD_CLOCKS[i])) {
+    if (SD.begin(SD_CS, SD_SPI, SD_CLOCKS[i])) {
       Serial.println("OK");
       return true;
     }
@@ -224,7 +249,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   Serial.println("OK: tft.init() complete");
 
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
+  SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
   if (!initSD()) {
     showFatalError("SD card init failed");
@@ -275,7 +300,13 @@ void loop() {
   // block inside the library and swallow button presses.
   if (gifIsOpen && (long)(millis() - nextFrameMs) >= 0) {
     int frameDelayMs = 0;
+#if SD_DEDICATED_BUS
+    tft.startWrite();
+#endif
     int result = gif.playFrame(false, &frameDelayMs);
+#if SD_DEDICATED_BUS
+    tft.endWrite();
+#endif
     if (frameDelayMs < MIN_FRAME_MS) frameDelayMs = MIN_FRAME_MS;
     nextFrameMs = millis() + frameDelayMs;
 
