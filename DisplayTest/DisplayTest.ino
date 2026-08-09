@@ -14,6 +14,11 @@ static uint16_t lineBuffer[MAX_LINE_PIXELS];
 
 static const unsigned long HOLD_MS = 3000;
 
+// The test box, inset from the panel edges so the border is visible and an
+// off-by-one address window cannot hide off screen. Sized at runtime, so the same
+// sketch works on a 480x320 ILI9488 and a 160x128 ST7735.
+static int boxX, boxY, boxW, boxH;
+
 // Raw RGB565 constants are pushed here, so the byte order has to be corrected
 // for the panel. On ILI9488 (SPI_18BIT_DRIVER) TFT_eSPI inverts the sense of
 // this flag: setSwapBytes(true) is what sends TFT_BLUE as blue. The GIF player
@@ -92,7 +97,14 @@ void setup() {
   tft.setRotation(1);
   tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
-  Serial.printf("panel: %d x %d\n", tft.width(), tft.height());
+
+  boxX = tft.width() / 16;
+  boxY = 2;
+  boxW = tft.width() - 2 * boxX;
+  boxH = tft.height() - 2 * boxY;
+
+  Serial.printf("panel: %d x %d, test box %dx%d at %d,%d\n",
+                tft.width(), tft.height(), boxW, boxH, boxX, boxY);
 #ifdef SPI_FREQUENCY
   Serial.printf("SPI_FREQUENCY: %d\n", SPI_FREQUENCY);
 #endif
@@ -104,29 +116,36 @@ void setup() {
 }
 
 void loop() {
+  // Pattern 0 uses nothing but fillScreen(): if the panel does not go red, then
+  // green, then blue, no commands are reaching it at all and the later patterns
+  // say nothing. That is wiring (CS/DC/RST) or the wrong driver in User_Setup.h.
+  tft.fillScreen(TFT_RED);   hold("0: whole screen red");
+  tft.fillScreen(TFT_GREEN); hold("0: whole screen green");
+  tft.fillScreen(TFT_BLUE);  hold("0: whole screen blue");
+
   tft.fillScreen(TFT_BLACK);
-  patternBorder(30, 2, 420, 315);
-  hold("1: white 1px border around a 420x315 box, 30px in from the left. "
+  patternBorder(boxX, boxY, boxW, boxH);
+  hold("1: white 1px border around a box inset from the panel edges. "
        "Bent or doubled edges = address window problem.");
 
   tft.fillScreen(TFT_BLACK);
-  patternSolidRect(30, 2, 420, 315, TFT_BLUE);
-  hold("2: even blue 420x315 box. Banding or streaks = SPI_FREQUENCY too high.");
+  patternSolidRect(boxX, boxY, boxW, boxH, TFT_BLUE);
+  hold("2: even blue box. Banding or streaks = SPI_FREQUENCY too high.");
 
   tft.fillScreen(TFT_BLACK);
-  patternColourBars(30, 2, 420, 315);
+  patternColourBars(boxX, boxY, boxW, boxH);
   hold("3: red, green, blue, yellow, cyan, magenta, white, black bars in that "
        "order left to right. Wrong colours = byte order.");
 
   tft.fillScreen(TFT_BLACK);
-  patternOddRuns(30, 2, 420, 315);
+  patternOddRuns(boxX, boxY, boxW, boxH);
   hold("4: ragged vertical white stripes, straight and inside the box. Sheared "
        "or leaning stripes = short runs are misaligning.");
 
   // Whether fillScreen() actually clears matters on its own: the player relies
   // on it between files, and leftovers would look like stray bands behind a GIF.
   tft.fillScreen(TFT_BLACK);
-  patternSolidRect(200, 130, 80, 60, TFT_WHITE);
+  patternSolidRect(tft.width() / 2 - 20, tft.height() / 2 - 15, 40, 30, TFT_WHITE);
   hold("5: one small white box in the middle of an otherwise black screen. "
        "Anything left over from pattern 4 means fillScreen() is not clearing.");
 }
