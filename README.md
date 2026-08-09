@@ -50,6 +50,16 @@ check: no display, no GIF decoding. It reports the MISO idle level, bit-bangs
 CMD0 and prints the raw response (`01` = card alive in SPI mode, all `FF` =
 nothing driving MISO), then mounts the card and lists the root.
 
+[`DisplayTest/DisplayTest.ino`](DisplayTest/DisplayTest.ino) is the same idea for
+the panel: no card, no decoding. It draws a border, a solid fill, colour bars and
+odd-length runs through the same `setAddrWindow()`/`pushPixels()` path the player
+uses, and prints what each pattern should look like, which separates address
+window and byte order faults from anything the GIF decoder does.
+
+Setting `DEBUG_FRAMES` to `1` in `GifPlayer.ino` logs every frame's rectangle,
+disposal method and transparency flag along with its decode+draw time, which is
+how to tell a bandwidth limit from a rendering bug.
+
 ## Libraries
 
 - [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI)
