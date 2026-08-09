@@ -243,15 +243,22 @@ void setup() {
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
 
-  // Bring the display up first so SD failures can be reported on screen.
+  // Order is load-bearing: the card must be brought up before tft.init().
+  // Calling SPI.begin() afterwards tears down the bus TFT_eSPI just claimed
+  // ("spiDetachBus(): Stopping SPI bus"), and the card then answers nothing at
+  // CMD0. The delay also keeps the display's power-on current draw off the rail
+  // while the card is still answering. The screen is only initialised early
+  // enough to report a card failure, which is why that is reported after.
+  SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  bool sdOk = initSD();
+  delay(100);
+
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
   Serial.println("OK: tft.init() complete");
 
-  SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-
-  if (!initSD()) {
+  if (!sdOk) {
     showFatalError("SD card init failed");
     while (1) delay(1000);
   }
