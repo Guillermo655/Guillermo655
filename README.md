@@ -51,9 +51,24 @@ overhead rather than pixels.
    3 bytes per pixel is a hardware floor: 420x315 is ~397 KB per frame against
    ~130 KB at 240x180. Pixel count is the dominant cost.
 
-DMA is not available on this combination: `User_Setup_Select.h` defines
-`SPI_18BIT_DRIVER` for the ILI9488, and `Processors/TFT_eSPI_ESP32.h` only defines
-`ESP32_DMA` when that is *off*, so `initDMA()`/`pushPixelsDMA()` do not link.
+DMA (`USE_DMA 1`) transfers one line while the next is decoded, using two
+alternating buffers. It is only compiled in when TFT_eSPI offers it: the library
+defines `ESP32_DMA` in `Processors/TFT_eSPI_ESP32.h` *unless* the panel is in
+18-bit mode, and `User_Setup_Select.h` puts the ILI9488 in 18-bit mode, so DMA is
+live on an ST7735 and silently absent on the ILI9488.
+
+## 1.8" 128x160 ST7735 instead
+
+[`User_Setup_ST7735.h`](User_Setup_ST7735.h) replaces the whole contents of
+`TFT_eSPI/User_Setup.h` for the smaller panel; the display keeps the same pins
+(SCLK 18, MOSI 23, CS 14, DC 27, RST 22) and the card side does not change. It is
+a large speed win: 128x160 at 2 bytes per pixel is ~40 KB per frame against
+~397 KB for a 420x315 frame on the ILI9488, and DMA becomes available.
+
+Two things to know: the sketch centres and clips rather than scaling, so GIFs have
+to be 160x128 or smaller, and the ST7735 tab variant (`ST7735_REDTAB` and the
+alternatives listed in the file) has to be matched to the board by eye - the wrong
+one shows a stripe of noise along one edge or inverted colours.
 
 ## Troubleshooting
 

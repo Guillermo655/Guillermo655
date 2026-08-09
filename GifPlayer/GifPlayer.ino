@@ -55,13 +55,23 @@ static const int MAX_FRAME_ERRORS = 3;
 // 1 = let AnimatedGIF compose whole lines in a canvas-sized buffer ("cooked"
 // pixels) instead of handing us palettised lines to stitch together. Each line
 // then becomes one contiguous push under a single address window per frame,
-// which is the largest speed-up available on this panel: TFT_eSPI has no DMA for
-// the ILI9488, because User_Setup_Select.h turns SPI_18BIT_DRIVER on for it and
-// the ESP32 processor header only defines ESP32_DMA when that is off.
+// instead of one address window per opaque run.
 //
 // Needs canvas width * (canvas height + 2) bytes of heap; the sketch falls back
 // to composing the lines itself if that allocation fails.
 #define COOKED_PIXELS 1
+
+// 1 = push each cooked line by DMA, so one line transfers while the next is
+// decoded. TFT_eSPI only offers DMA when the panel is not in 18-bit mode, so this
+// is live on an ST7735 and silently unavailable on an ILI9488: ESP32_DMA is what
+// the library defines in that case, and without it initDMA() does not even link.
+#define USE_DMA 1
+
+#if USE_DMA && defined(ESP32_DMA)
+  #define DMA_AVAILABLE 1
+#else
+  #define DMA_AVAILABLE 0
+#endif
 
 #define MAX_GIFS 32
 #define MAX_NAME_LEN 64
@@ -83,6 +93,22 @@ int xOffset = 0;
 int yOffset = 0;
 
 static uint16_t lineBuffer[MAX_LINE_PIXELS];
+
+#if DMA_AVAILABLE
+// Two buffers, used alternately: a DMA transfer reads from memory after the call
+// returns, so the next line has to be assembled somewhere else. pushPixelsDMA()
+// waits for the outstanding transfer before starting a new one, which is what
+// makes two enough.
+static uint16_t dmaBuffer[2][MAX_LINE_PIXELS];
+static uint8_t dmaSlot = 0;
+
+static void pushRunDMA(int len, uint16_t *pixels) {
+  uint16_t *dst = dmaBuffer[dmaSlot];
+  dmaSlot ^= 1;
+  memcpy(dst, pixels, len * sizeof(uint16_t));
+  tft.pushPixelsDMA(dst, len);
+}
+#endif
 
 // Pushes one horizontal run of pixels.
 //
@@ -137,7 +163,11 @@ void GIFDraw(GIFDRAW *pDraw) {
         tft.setAddrWindow(drawX, pDraw->iY + yOffset, w, pDraw->iHeight);
         cookedWindowSet = true;
       }
+#if DMA_AVAILABLE
+      pushRunDMA(w, src);
+#else
       tft.pushPixels(src, w);
+#endif
       return;
     }
 #endif
@@ -351,7 +381,11 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  Serial.println("OK: tft.init() complete");
+#if DMA_AVAILABLE
+  tft.initDMA();
+#endif
+  Serial.printf("OK: tft.init() complete, %dx%d, DMA %s\n",
+                tft.width(), tft.height(), DMA_AVAILABLE ? "on" : "off");
 
   if (!sdOk) {
     showFatalError("SD card init failed");
