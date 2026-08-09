@@ -38,10 +38,22 @@ overhead rather than pixels.
    devices at once — which is why the sketch keys the locking off the same flag
    as the pin choice.
 2. **Raise `SPI_FREQUENCY` in `User_Setup.h`.** ILI9488 panels usually run at
-   40 MHz; the TFT_eSPI defaults are more conservative.
-3. **DMA (`pushPixelsDMA`).** Overlaps the transfer of one line with decoding of
-   the next, but needs alternating line buffers to avoid overwriting a buffer
-   mid-transfer. Not implemented here.
+   40 MHz, some at 80; the TFT_eSPI defaults are more conservative. Values far
+   out of range do not simply fail — at 400 MHz this panel accepted writes but
+   corrupted them, which looks like a stretched, glitching image rather than a
+   dead display.
+3. **Keep `COOKED_PIXELS 1`.** The library composes each line in a canvas-sized
+   buffer and hands back finished pixels, so a line is one contiguous push under
+   a single address window per frame instead of one window per opaque run. The
+   sketch allocates `canvasWidth * (canvasHeight + 2)` bytes per file and falls
+   back to composing lines itself if the heap cannot cover it.
+4. **Shrink the GIFs.** The ILI9488 only accepts 18-bit pixels over SPI, so
+   3 bytes per pixel is a hardware floor: 420x315 is ~397 KB per frame against
+   ~130 KB at 240x180. Pixel count is the dominant cost.
+
+DMA is not available on this combination: `User_Setup_Select.h` defines
+`SPI_18BIT_DRIVER` for the ILI9488, and `Processors/TFT_eSPI_ESP32.h` only defines
+`ESP32_DMA` when that is *off*, so `initDMA()`/`pushPixelsDMA()` do not link.
 
 ## Troubleshooting
 

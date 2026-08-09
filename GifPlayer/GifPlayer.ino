@@ -52,6 +52,17 @@ static const int MIN_FRAME_MS = 10;
 // Consecutive frame failures tolerated on one file before skipping it.
 static const int MAX_FRAME_ERRORS = 3;
 
+// 1 = let AnimatedGIF compose whole lines in a canvas-sized buffer ("cooked"
+// pixels) instead of handing us palettised lines to stitch together. Each line
+// then becomes one contiguous push under a single address window per frame,
+// which is the largest speed-up available on this panel: TFT_eSPI has no DMA for
+// the ILI9488, because User_Setup_Select.h turns SPI_18BIT_DRIVER on for it and
+// the ESP32 processor header only defines ESP32_DMA when that is off.
+//
+// Needs canvas width * (canvas height + 2) bytes of heap; the sketch falls back
+// to composing the lines itself if that allocation fails.
+#define COOKED_PIXELS 1
+
 #define MAX_GIFS 32
 #define MAX_NAME_LEN 64
 
@@ -63,6 +74,9 @@ bool changeGifSignal = false;
 bool gifIsOpen = false;
 unsigned long nextFrameMs = 0;
 int frameErrors = 0;
+uint8_t *frameBuf = NULL;
+bool cooked = false;             // library is composing whole lines for us
+bool cookedWindowSet = false;    // address window already set for this frame
 
 // Centring offsets for the file currently open, recomputed once per file.
 int xOffset = 0;
@@ -98,17 +112,44 @@ void GIFDraw(GIFDRAW *pDraw) {
   if (iWidth > MAX_LINE_PIXELS) iWidth = MAX_LINE_PIXELS;
   if (iWidth < 1) return;
 
-  // pPalette is always populated by the library and is already byte-swapped for
-  // SPI because begin() was called with BIG_ENDIAN_PIXELS.
-  uint16_t *pPal = pDraw->pPalette;
-  uint8_t *s = pDraw->pPixels;
-
 #if DEBUG_FRAMES
   if (pDraw->y == 0)
     Serial.printf("frame x=%d y=%d w=%d h=%d disposal=%u transparent=%u\n",
                   pDraw->iX, pDraw->iY, pDraw->iWidth, pDraw->iHeight,
                   pDraw->ucDisposalMethod, pDraw->ucHasTransparency);
 #endif
+
+#if COOKED_PIXELS
+  if (cooked) {
+    // pPixels is a finished RGB565 line: the library has already applied the
+    // palette, transparency and disposal against its canvas buffer, so the whole
+    // line goes out in one push. On a dedicated bus the address window can also
+    // stay open for the rest of the frame, which removes one command/data switch
+    // per line - the expensive part on an SPI panel.
+    uint16_t *src = (uint16_t *)pDraw->pPixels;
+    int w = pDraw->iWidth;
+    if (drawX + w > tft.width()) w = tft.width() - drawX;
+    if (w < 1) return;
+#if SD_DEDICATED_BUS
+    if (w == pDraw->iWidth &&
+        pDraw->iY + yOffset + pDraw->iHeight <= tft.height()) {
+      if (!cookedWindowSet) {
+        tft.setAddrWindow(drawX, pDraw->iY + yOffset, w, pDraw->iHeight);
+        cookedWindowSet = true;
+      }
+      tft.pushPixels(src, w);
+      return;
+    }
+#endif
+    pushRun(drawX, drawY, w, src);
+    return;
+  }
+#endif
+
+  // pPalette is always populated by the library and is already byte-swapped for
+  // SPI because begin() was called with BIG_ENDIAN_PIXELS.
+  uint16_t *pPal = pDraw->pPalette;
+  uint8_t *s = pDraw->pPixels;
 
   if (pDraw->ucDisposalMethod == 2) {
     // "Restore to background": transparent pixels become the background colour
@@ -210,6 +251,33 @@ void scanGifs() {
   Serial.printf("%d GIF(s) on card\n", gifCount);
 }
 
+// Gives the library a canvas-sized buffer so it can hand back finished pixels.
+// Sized per file, since the canvas differs between files. Falls back to the
+// palettised path when there is not enough heap, which is why the sketch still
+// carries its own transparency and disposal handling.
+void setupFrameBuf() {
+  cooked = false;
+#if COOKED_PIXELS
+  if (frameBuf) { free(frameBuf); frameBuf = NULL; }
+
+  int w = gif.getCanvasWidth();
+  int h = gif.getCanvasHeight();
+  // Canvas as 8-bit pixels, plus two lines of room for the composed output.
+  size_t need = (size_t)w * (h + 2);
+  frameBuf = (uint8_t *)malloc(need);
+  if (!frameBuf) {
+    Serial.printf("cooked mode off: %u bytes unavailable (%u free)\n",
+                  (unsigned)need, (unsigned)ESP.getFreeHeap());
+    gif.setDrawType(GIF_DRAW_RAW);
+    return;
+  }
+  gif.setFrameBuf(frameBuf);
+  cooked = (gif.setDrawType(GIF_DRAW_COOKED) == GIF_SUCCESS);
+  Serial.printf("cooked mode %s (%u byte canvas buffer)\n",
+                cooked ? "on" : "off", (unsigned)need);
+#endif
+}
+
 void startNewGif(int index) {
   if (gifIsOpen) gif.close();
   gifIsOpen = false;
@@ -228,6 +296,7 @@ void startNewGif(int index) {
     if (xOffset < 0) xOffset = 0;
     if (yOffset < 0) yOffset = 0;
     Serial.printf("GIF opened OK: %d x %d\n", gif.getCanvasWidth(), gif.getCanvasHeight());
+    setupFrameBuf();
     gifIsOpen = true;
     nextFrameMs = millis();
   } else {
@@ -336,6 +405,7 @@ void loop() {
 #if DEBUG_FRAMES
     unsigned long frameStartMs = millis();
 #endif
+    cookedWindowSet = false;   // each frame opens its own address window
 #if SD_DEDICATED_BUS
     tft.startWrite();
 #endif
