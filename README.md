@@ -27,11 +27,18 @@ SPI bus, so `SUPPORT_TRANSACTIONS` must be enabled in the TFT_eSPI setup
 
 ## SD card layout
 
-GIFs must be in the card root, named `1.gif`, `2.gif`, `3.gif`, ... The number
-of files the sketch cycles through is set by `TOTAL_GIFS` in the sketch.
+Any `.gif` files in the card root are picked up: the sketch indexes them at boot
+(up to `MAX_GIFS`) and the buttons cycle through what it found, so no particular
+naming scheme is required.
 
 For smooth playback, keep the GIF canvas at or below the display resolution
 (480x320) and use a FAT32-formatted card.
+
+## Building
+
+```
+arduino-cli compile -b esp32:esp32:esp32 GifPlayer
+```
 
 ## Sketch
 
