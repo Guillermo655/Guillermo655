@@ -18,6 +18,9 @@
   ---------------------------------------------------------------------------
   2. WIRING DIAGRAM
   ---------------------------------------------------------------------------
+  Display runs in LANDSCAPE (480x320) via tft.setRotation(1).
+  Use setRotation(3) if you want it rotated 180 degrees.
+
   ILI9488 DISPLAY:
     VCC    -> 5V or 3.3V (check your module)
     GND    -> GND
@@ -115,6 +118,7 @@ TFT_eSPI tft = TFT_eSPI();
 #define CAPS_PIN 5
 #define HOLD_MS 1000        // long-press duration for #, * and D
 #define HTTP_TIMEOUT_MS 20000
+#define SCROLL_CHARS 78      // roughly one line of text at 480px wide, size 1
 String ssid, password, aiPersona;
 const char* apiKey = "YOUR_GROQ_API_KEY";   // <-- paste your key here
 
@@ -142,7 +146,7 @@ int scrollPos = 0;
 void setup() {
   Serial.begin(115200);
   pinMode(CAPS_PIN, INPUT_PULLUP);
-  tft.init(); tft.setRotation(0); tft.fillScreen(TFT_BLACK);
+  tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);   // 1 = landscape 480x320 (use 3 to flip 180)
 
   keypad.setHoldTime(HOLD_MS);
 
@@ -158,8 +162,8 @@ void checkCaps() {
   bool down = (digitalRead(CAPS_PIN) == LOW);
   if (down && !capsBtnWasDown) {
     capsLock = !capsLock;
-    tft.fillRect(190, 5, 130, 15, TFT_BLACK);
-    tft.setCursor(200, 10); tft.setTextSize(1);
+    tft.fillRect(350, 5, 130, 15, TFT_BLACK);
+    tft.setCursor(360, 10); tft.setTextSize(1);
     tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
     tft.print(capsLock ? "CAPS: ON" : "CAPS: OFF");
   }
@@ -223,9 +227,9 @@ void loop() {
         }
         else if (k == '#') { if (userQuery.length() > 0) { askGroq(userQuery); userQuery = ""; } }
         else if (k == '*') { userQuery += "*"; updateTypingBarGeneric(userQuery); }
-        else if (k == 'A') { scrollPos = max(0, scrollPos - 25); refreshUI("AI RESPONSE:", lastAIResponse); }
+        else if (k == 'A') { scrollPos = max(0, scrollPos - SCROLL_CHARS); refreshUI("AI RESPONSE:", lastAIResponse); }
         else if (k == 'B') {
-          scrollPos = min(scrollPos + 25, (int)lastAIResponse.length());
+          scrollPos = min(scrollPos + SCROLL_CHARS, (int)lastAIResponse.length());
           refreshUI("AI RESPONSE:", lastAIResponse);
         }
         break;
@@ -274,8 +278,8 @@ void personaMenu() {
 
 // --- UTILS ---
 void updateTypingBarGeneric(String txt) {
-  tft.fillRect(0, 440, 320, 40, TFT_BLACK);
-  tft.setCursor(5, 450); tft.setTextColor(TFT_YELLOW, TFT_BLACK); tft.setTextSize(1);
+  tft.fillRect(0, 290, 480, 30, TFT_BLACK);
+  tft.setCursor(5, 300); tft.setTextColor(TFT_YELLOW, TFT_BLACK); tft.setTextSize(1);
   tft.print("> " + txt + "_");
 }
 
@@ -283,7 +287,7 @@ void refreshUI(String title, String body) {
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(10, 10); tft.setTextColor(TFT_GREEN, TFT_BLACK); tft.setTextSize(2);
   tft.println(title);
-  tft.setCursor(10, 60); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(1);
+  tft.setCursor(10, 45); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(1);
   tft.setTextWrap(true);
   if (scrollPos > (int)body.length()) scrollPos = body.length();
   tft.println(body.substring(scrollPos));
