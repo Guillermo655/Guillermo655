@@ -29,7 +29,21 @@
     RST    -> GPIO 4
     SDI    -> GPIO 23 (MOSI)
     SCK    -> GPIO 18
-    LED    -> 3.3V (always on)
+    LED    -> GPIO 22  (backlight control -- see note below)
+
+  BACKLIGHT NOTE:
+    Most ILI9488 breakout boards have an onboard backlight driver /
+    series resistor on the LED pin, so it is a logic-level input and can
+    be driven straight from GPIO 22. If your board's LED pin feeds the
+    LEDs directly (it will pull well over 40mA and the ESP32 pin gets
+    hot / the screen is dim), drive it through a transistor instead:
+
+      GPIO 22 --[1k]--> base of a 2N2222 NPN
+      LED pin --------> collector
+      GND ------------> emitter
+
+    Or just leave LED wired to 3.3V and set BL_PIN to -1 below; the
+    screen will blank on power-off but the backlight stays lit.
 
   4x4 MATRIX KEYPAD:
     Row 1  -> GPIO 16
@@ -95,8 +109,9 @@
   - [C]   : Cycle symbols  " ! ? ; :
   - [D]   : TAP for backspace  | HOLD (1s) to CLEAR ALL.
   - [Btn] : Physical button (GPIO 25) toggles CAPS LOCK.
-            HOLD it for 5s to POWER OFF (display sleeps, ESP32 enters
-            deep sleep). Press the same button again to turn it back on.
+            HOLD it for 5s to POWER OFF (backlight off, panel asleep,
+            ESP32 in deep sleep -- the screen goes completely dark).
+            Press the same button again to turn it back on.
 
   MENUS:
   - Same T9 typing. [#] confirms and moves to the next step.
@@ -124,6 +139,8 @@ TFT_eSPI tft = TFT_eSPI();
 #define HTTP_TIMEOUT_MS 20000
 #define SCROLL_CHARS 78      // roughly one line of text at 480px wide, size 1
 #define POWEROFF_MS 5000     // hold the caps button this long to power down
+#define BL_PIN 22            // backlight control; set to -1 if LED is wired to 3.3V
+#define BL_ON HIGH           // flip to LOW if your board's backlight is active-low
 String ssid, password, aiPersona;
 const char* apiKey = "YOUR_GROQ_API_KEY";   // <-- paste your key here
 
@@ -153,6 +170,8 @@ void setup() {
   Serial.begin(115200);
   rtc_gpio_deinit((gpio_num_t)CAPS_PIN);   // release the pin after a deep-sleep wake
   pinMode(CAPS_PIN, INPUT_PULLUP);
+  if (BL_PIN >= 0) { gpio_deep_sleep_hold_dis(); gpio_hold_dis((gpio_num_t)BL_PIN); }
+  backlight(true);
   tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);   // 1 = landscape 480x320 (use 3 to flip 180)
 
   keypad.setHoldTime(HOLD_MS);
@@ -164,8 +183,14 @@ void setup() {
   connectToWiFi();
 }
 
-// Blanks the panel, puts it in sleep mode and deep-sleeps the ESP32.
-// Press the board's EN/RESET button to turn it back on.
+void backlight(bool on) {
+  if (BL_PIN < 0) return;
+  pinMode(BL_PIN, OUTPUT);
+  digitalWrite(BL_PIN, on ? BL_ON : !BL_ON);
+}
+
+// Blanks the panel, kills the backlight and deep-sleeps the ESP32.
+// Press the caps button again to wake it back up.
 void powerDown() {
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(150, 150); tft.setTextSize(2); tft.setTextColor(TFT_RED, TFT_BLACK);
@@ -175,6 +200,11 @@ void powerDown() {
   tft.writecommand(TFT_DISPOFF);   // display off
   tft.writecommand(TFT_SLPIN);     // panel sleep
   delay(150);
+  backlight(false);                // kill the backlight: screen fully dark
+  if (BL_PIN >= 0) {               // keep the pin driven while asleep,
+    gpio_hold_en((gpio_num_t)BL_PIN);   // otherwise it floats and the
+    gpio_deep_sleep_hold_en();          // backlight can flicker back on
+  }
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
