@@ -44,7 +44,8 @@
     Col 4  -> GPIO 13
 
   CAPS LOCK BUTTON:
-    Pin 1  -> GPIO 5
+    Pin 1  -> GPIO 25   (was GPIO 5; GPIO 25 is RTC-capable so it can also
+                         wake the board from deep sleep)
     Pin 2  -> GND (uses internal pull-up)
 
   ---------------------------------------------------------------------------
@@ -93,10 +94,9 @@
   - [B]   : Scroll AI text DOWN.
   - [C]   : Cycle symbols  " ! ? ; :
   - [D]   : TAP for backspace  | HOLD (1s) to CLEAR ALL.
-  - [Btn] : Physical button (GPIO 5) toggles CAPS LOCK.
+  - [Btn] : Physical button (GPIO 25) toggles CAPS LOCK.
             HOLD it for 5s to POWER OFF (display sleeps, ESP32 enters
-            deep sleep). GPIO 5 is not an RTC pin so it cannot wake the
-            chip: press the board's EN/RESET button to turn it back on.
+            deep sleep). Press the same button again to turn it back on.
 
   MENUS:
   - Same T9 typing. [#] confirms and moves to the next step.
@@ -113,12 +113,13 @@
 #include <TFT_eSPI.h>
 #include <Keypad.h>
 #include <Preferences.h>
+#include <driver/rtc_io.h>
 
 Preferences prefs;
 TFT_eSPI tft = TFT_eSPI();
 
 // --- CONFIG ---
-#define CAPS_PIN 5
+#define CAPS_PIN 25          // RTC-capable pin, so it can wake from deep sleep
 #define HOLD_MS 1000        // long-press duration for #, * and D
 #define HTTP_TIMEOUT_MS 20000
 #define SCROLL_CHARS 78      // roughly one line of text at 480px wide, size 1
@@ -150,6 +151,7 @@ int scrollPos = 0;
 
 void setup() {
   Serial.begin(115200);
+  rtc_gpio_deinit((gpio_num_t)CAPS_PIN);   // release the pin after a deep-sleep wake
   pinMode(CAPS_PIN, INPUT_PULLUP);
   tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);   // 1 = landscape 480x320 (use 3 to flip 180)
 
@@ -176,6 +178,14 @@ void powerDown() {
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+
+  // Wait for the button to be let go, otherwise we'd wake up instantly.
+  while (digitalRead(CAPS_PIN) == LOW) delay(20);
+  delay(50);
+
+  rtc_gpio_pullup_en((gpio_num_t)CAPS_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)CAPS_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)CAPS_PIN, 0);   // wake when pulled LOW
   esp_deep_sleep_start();
 }
 
