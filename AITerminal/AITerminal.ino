@@ -94,6 +94,9 @@
   - [C]   : Cycle symbols  " ! ? ; :
   - [D]   : TAP for backspace  | HOLD (1s) to CLEAR ALL.
   - [Btn] : Physical button (GPIO 5) toggles CAPS LOCK.
+            HOLD it for 5s to POWER OFF (display sleeps, ESP32 enters
+            deep sleep). GPIO 5 is not an RTC pin so it cannot wake the
+            chip: press the board's EN/RESET button to turn it back on.
 
   MENUS:
   - Same T9 typing. [#] confirms and moves to the next step.
@@ -119,6 +122,7 @@ TFT_eSPI tft = TFT_eSPI();
 #define HOLD_MS 1000        // long-press duration for #, * and D
 #define HTTP_TIMEOUT_MS 20000
 #define SCROLL_CHARS 78      // roughly one line of text at 480px wide, size 1
+#define POWEROFF_MS 5000     // hold the caps button this long to power down
 String ssid, password, aiPersona;
 const char* apiKey = "YOUR_GROQ_API_KEY";   // <-- paste your key here
 
@@ -139,6 +143,7 @@ char lastKeyUsed = NO_KEY;
 unsigned long lastPressTime = 0;
 bool capsLock = false;
 bool capsBtnWasDown = false;
+unsigned long capsDownSince = 0;
 String userQuery = "";
 String lastAIResponse = "No messages.";
 int scrollPos = 0;
@@ -157,16 +162,36 @@ void setup() {
   connectToWiFi();
 }
 
+// Blanks the panel, puts it in sleep mode and deep-sleeps the ESP32.
+// Press the board's EN/RESET button to turn it back on.
+void powerDown() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(150, 150); tft.setTextSize(2); tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.print("POWERING OFF");
+  delay(700);
+  tft.fillScreen(TFT_BLACK);
+  tft.writecommand(TFT_DISPOFF);   // display off
+  tft.writecommand(TFT_SLPIN);     // panel sleep
+  delay(150);
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_deep_sleep_start();
+}
+
 // Edge-detected caps toggle: fires once per press, not while held.
+// Holding the same button for POWEROFF_MS shuts the terminal down.
 void checkCaps() {
   bool down = (digitalRead(CAPS_PIN) == LOW);
   if (down && !capsBtnWasDown) {
+    capsDownSince = millis();
     capsLock = !capsLock;
     tft.fillRect(350, 5, 130, 15, TFT_BLACK);
     tft.setCursor(360, 10); tft.setTextSize(1);
     tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
     tft.print(capsLock ? "CAPS: ON" : "CAPS: OFF");
   }
+  if (down && (millis() - capsDownSince) >= POWEROFF_MS) powerDown();
   capsBtnWasDown = down;
 }
 
